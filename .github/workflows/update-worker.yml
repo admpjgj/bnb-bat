@@ -5,7 +5,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: "0 1 * * *" # 每天凌晨1点自动运行
+    - cron: "0 1 * * *" # 每天凌晨1点自动运行（UTC时间）
   workflow_dispatch:     # 支持手动运行
 
 permissions:
@@ -17,6 +17,13 @@ jobs:
     steps:
       - name: 初始化仓库
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 设置日志时间
+        run: |
+          echo "运行时间: $(date)"
+          echo "触发事件: ${{ github.event_name }}"
 
       - name: 获取当前本地版本
         id: get_local_version
@@ -25,24 +32,35 @@ jobs:
           if [ -f version.txt ]; then
             LOCAL_VERSION=$(cat version.txt)
             echo "当前本地版本: $LOCAL_VERSION"
+            echo "LOCAL_VERSION=$LOCAL_VERSION" >> $GITHUB_ENV
           else
             echo "首次同步，没有本地版本。"
-            LOCAL_VERSION=""
+            echo "LOCAL_VERSION=" >> $GITHUB_ENV
           fi
-          echo "LOCAL_VERSION=$LOCAL_VERSION" >> $GITHUB_ENV
 
       - name: 获取最新 Release 信息
         id: get_release
         run: |
           echo -e "\033[34m[获取最新 Release]\033[0m"
           API_URL="https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases"
-          RESPONSE=$(curl -s "$API_URL")
+          # 添加 GitHub token 以避免速率限制
+          AUTH_HEADER="Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}"
+          RESPONSE=$(curl -H "$AUTH_HEADER" -s "$API_URL")
+          
+          # 检查 API 响应是否有效
+          if [ -z "$RESPONSE" ] || [ "$RESPONSE" == "[]" ]; then
+            echo -e "\033[31mAPI 响应为空，可能是速率限制或仓库不存在\033[0m"
+            exit 1
+          fi
+          
           LATEST_RELEASE=$(echo "$RESPONSE" | jq -r '.[0]')
           TAG_NAME=$(echo "$LATEST_RELEASE" | jq -r '.tag_name')
           DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | jq -r '.assets[] | select(.name == "worker.zip") | .browser_download_url')
 
           if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
-            echo -e "\033[31m未找到 worker.zip，退出！\033[0m"
+            echo -e "\033[31m未找到 worker.zip，检查 Release 资源名称\033[0m"
+            echo "可用的资源:"
+            echo "$LATEST_RELEASE" | jq -r '.assets[].name'
             exit 1
           fi
 
@@ -54,7 +72,10 @@ jobs:
         id: check_update
         run: |
           echo -e "\033[34m[判断是否需要更新]\033[0m"
-          if [ "$LOCAL_VERSION" = "$TAG_NAME" ]; then
+          echo "本地版本: ${{ env.LOCAL_VERSION }}"
+          echo "最新版本: ${{ env.TAG_NAME }}"
+          
+          if [ "${{ env.LOCAL_VERSION }}" = "${{ env.TAG_NAME }}" ]; then
             echo -e "\033[32m已经是最新版本，无需更新。\033[0m"
             echo "UPDATE_NEEDED=false" >> $GITHUB_ENV
           else
@@ -66,15 +87,30 @@ jobs:
         if: env.UPDATE_NEEDED == 'true'
         run: |
           echo -e "\033[34m[清理旧文件]\033[0m"
-          rm -rf ./*
+          # 保留必要的配置文件
+          if [ -f config.json ]; then
+            mv config.json config.json.backup
+          fi
+          
+          # 清理除 .git 外的所有文件
+          find . -maxdepth 1 ! -name '.git' ! -name '.github' -exec rm -rf {} \; 2>/dev/null || true
+          
+          # 恢复配置文件
+          if [ -f config.json.backup ]; then
+            mv config.json.backup config.json
+          fi
+          
           echo -e "\033[34m[下载最新 worker.zip]\033[0m"
-          wget -O worker.zip "$DOWNLOAD_URL"
+          wget -O worker.zip "${{ env.DOWNLOAD_URL }}"
+          
           echo -e "\033[34m[解压 worker.zip]\033[0m"
-          unzip worker.zip
+          unzip -o worker.zip
+          
           echo -e "\033[34m[删除 worker.zip]\033[0m"
           rm worker.zip
+          
           echo -e "\033[34m[记录新版本号]\033[0m"
-          echo "$TAG_NAME" > version.txt
+          echo "${{ env.TAG_NAME }}" > version.txt
 
       - name: 提交更改
         if: env.UPDATE_NEEDED == 'true'
@@ -82,4 +118,4 @@ jobs:
         with:
           commit_message: "🔄 自动同步最新 Worker 版本：${{ env.TAG_NAME }}"
           commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
-          push_options: --force
+          branch: main
